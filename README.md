@@ -20,6 +20,12 @@ curl -X POST localhost:8000/predict -H "Content-Type: application/json" -d '{
 }'
 ```
 
+`POST /pubsub` reçoit les messages d'un abonnement push Pub/Sub, une transaction par message
+(JSON encodé en base64 dans `message.data`). Il score la transaction sans l'enregistrer dans les
+compteurs, écrit une ligne JSON `scored` dans les logs, puis renvoie 204 pour acquitter le message.
+Une transaction invalide (montant ≤ 0, champ manquant, message illisible) donne une ligne `rejected`
+et un 422 : Pub/Sub la relivre, puis l'envoie dans la file de messages morts.
+
 Le score dépend de 20 variables, calculées à partir de la transaction et de compteurs journaliers :
 
 | Famille | Variables | Source |
@@ -35,7 +41,7 @@ Les compteurs s'arrêtent au 30 septembre 2026. Les transactions à scorer comme
 
 | Fichier | Rôle |
 | --- | --- |
-| `app.py` | service FastAPI |
+| `app.py` | service FastAPI : `/health`, `/predict`, `/events`, `/pubsub` |
 | `features.py` | compteurs journaliers et calcul des 20 variables |
 | `scoring.py` | chargement du modèle, calcul des scores |
 | `settings.py` | variables `DATA_DIR`, `MODELS_DIR`, `XGB_NTHREAD` |

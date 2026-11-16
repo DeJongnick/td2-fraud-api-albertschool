@@ -1,10 +1,13 @@
-"""Service de scoring : GET /health, POST /predict, POST /events.
+"""Service de scoring : GET /health, POST /predict, POST /events, POST /pubsub.
 
 Le modèle et les compteurs journaliers sont chargés une fois par worker, au démarrage.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -12,8 +15,8 @@ from time import perf_counter
 
 import numpy as np
 import psutil
-from fastapi import FastAPI, Request
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import FastAPI, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import features as ft
 import scoring
@@ -45,6 +48,19 @@ class PredictResponse(BaseModel):
     scores: list[ScoredTransaction]
     timings_ms: dict[str, float]
     worker_pid: int
+
+
+class PushMessage(BaseModel):
+    data: str
+    messageId: str
+    publishTime: str | None = None
+    attributes: dict[str, str] = {}
+
+
+class PushEnvelope(BaseModel):
+    message: PushMessage
+    subscription: str
+    deliveryAttempt: int | None = None
 
 
 @asynccontextmanager
@@ -115,3 +131,42 @@ def predict(req: PredictRequest, request: Request) -> PredictResponse:
 def events(req: PredictRequest, request: Request) -> PredictResponse:
     """Score puis enregistre les transactions dans les compteurs du worker (flux)."""
     return _predict(req, request, record=True)
+
+
+def _log(severity: str, message: str, **fields) -> None:
+    """Une ligne JSON sur la sortie standard : Cloud Logging la range dans jsonPayload."""
+    print(json.dumps({"severity": severity, "message": message, **fields}), flush=True)
+
+
+@app.post("/pubsub", status_code=204)
+def pubsub(envelope: PushEnvelope, request: Request) -> Response:
+    """Abonnement push Pub/Sub : une transaction par message.
+
+    Tout code 2xx acquitte le message, tout autre code le fait relivrer. Le 204 n'est donc
+    renvoyé qu'une fois le score calculé et écrit dans les logs. Rien n'est enregistré dans les
+    compteurs : une nouvelle livraison du même message donne le même score.
+    """
+    attempt = envelope.deliveryAttempt
+    message_id = envelope.message.messageId
+    try:
+        payload = json.loads(base64.b64decode(envelope.message.data, validate=True))
+    except (binascii.Error, ValueError):
+        payload = None
+    tx_id = payload.get("TX_ID", payload.get("tx_id")) if isinstance(payload, dict) else None
+
+    try:
+        tx = Transaction.model_validate(payload)
+    except ValidationError:
+        _log("ERROR", "rejected", tx_id=tx_id, delivery_attempt=attempt, message_id=message_id)
+        return Response(status_code=422)
+
+    result = _predict(PredictRequest(transactions=[tx]), request, record=False)
+    _log(
+        "INFO",
+        "scored",
+        tx_id=tx.tx_id,
+        score=result.scores[0].score,
+        delivery_attempt=attempt,
+        message_id=message_id,
+    )
+    return Response(status_code=204)
