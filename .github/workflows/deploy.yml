@@ -1,0 +1,101 @@
+# Séance 2, partie D : déploiement continu de team3-fraud-api.
+# Un push construit l'image (linux/amd64), la pousse dans le registre partagé avec le hash du
+# commit pour tag, puis crée une révision du service SANS trafic, avec le tag « cd ». Le trafic
+# reste sur la révision décrite par Terraform : la mise en service est une décision à part.
+#
+# Terraform décrit l'infrastructure, ce workflow choisit la version de l'image : le bloc lifecycle
+# de google_cloud_run_v2_service.api (infra/main.tf du dépôt Terraform) ignore donc l'image et les
+# champs que gcloud modifie, pour que les deux ne se défassent pas l'un l'autre.
+name: deploy
+
+on:
+  push:
+    branches: [ci-livraison]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - pyproject.toml
+      - uv.lock
+      - "*.py"
+      - models/**
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+
+env:
+  TEAM: team3
+  REGION: europe-west1
+  PROJECT: advanced-cloud-ai
+  REPOSITORY: europe-west1-docker.pkg.dev/advanced-cloud-ai/cloud-ai
+  WIF_PROVIDER: projects/191726065850/locations/global/workloadIdentityPools/github/providers/github-actions
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.TEAM }}-cd@${{ env.PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push the image (linux/amd64)
+        id: image
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
+          IMAGE="$REPOSITORY/$TEAM-fraud-api:$GITHUB_SHA"
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy a revision without traffic (tag cd)
+        id: deploy
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          SERVICE="$TEAM-fraud-api"
+          gcloud run deploy "$SERVICE" --region "$REGION" --project "$PROJECT" --quiet \
+            --image "$IMAGE" --no-traffic --tag cd \
+            --revision-suffix "cd-${GITHUB_SHA::7}"
+          INFO=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" \
+            --flatten='status.traffic[]' \
+            --format='value(status.traffic.tag,status.traffic.revisionName,status.traffic.url)' |
+            awk -F'\t' '$1=="cd"{print $2 "\t" $3; exit}')
+          REVISION=${INFO%%$'\t'*}
+          echo "Révision : $REVISION"
+          echo "Adresse du tag : ${INFO#*$'\t'}"
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          echo "tag_url=${INFO#*$'\t'}" >> "$GITHUB_OUTPUT"
+
+      # Bloquant. team3-cd déploie mais n'a pas roles/run.invoker sur le service (moindre
+      # privilège : seuls l'équipe et team3-push l'appellent). Le test vérifie donc que la
+      # révision est prête, sert la bonne image, et que le service reste privé (403 sans jeton).
+      - name: Smoke test
+        env:
+          REVISION: ${{ steps.deploy.outputs.revision }}
+          TAG_URL: ${{ steps.deploy.outputs.tag_url }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          READY=$(gcloud run revisions describe "$REVISION" --region "$REGION" --project "$PROJECT" \
+            --format='value(status.conditions[0].type,status.conditions[0].status)')
+          echo "État de $REVISION : $READY"
+          [ "$READY" = $'Ready\tTrue' ] || { echo "::error::$REVISION n'est pas prête"; exit 1; }
+          SERVED=$(gcloud run revisions describe "$REVISION" --region "$REGION" --project "$PROJECT" \
+            --format='value(spec.containers[0].image)')
+          echo "Image servie : $SERVED"
+          case "$SERVED" in
+            "$IMAGE"|"${IMAGE%:*}@sha256:"*) ;;
+            *) echo "::error::image inattendue sur $REVISION"; exit 1 ;;
+          esac
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$TAG_URL/health")
+          echo "/health sans jeton : HTTP $code"
+          [ "$code" = 403 ] || { echo "::error::le service n'est plus privé (HTTP $code sans jeton)"; exit 1; }
+          echo "Test de fumée réussi sur $REVISION"
