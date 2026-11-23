@@ -1,6 +1,6 @@
 # Séance 2, partie D : déploiement continu de team3-fraud-api.
 # Un push construit l'image (linux/amd64), la pousse dans le registre partagé avec le hash du
-# commit pour tag, puis crée une révision du service SANS trafic, avec le tag « cd ». Le trafic
+# commit pour tag, puis crée une révision du service SANS trafic, avec le tag « livraison ». Le trafic
 # reste sur la révision décrite par Terraform : la mise en service est une décision à part.
 #
 # Terraform décrit l'infrastructure, ce workflow choisit la version de l'image : le bloc lifecycle
@@ -54,7 +54,7 @@ jobs:
           docker push "$IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy a revision without traffic (tag cd)
+      - name: Deploy a revision without traffic (tag livraison)
         id: deploy
         env:
           IMAGE: ${{ steps.image.outputs.image }}
@@ -62,12 +62,12 @@ jobs:
           set -euo pipefail
           SERVICE="$TEAM-fraud-api"
           gcloud run deploy "$SERVICE" --region "$REGION" --project "$PROJECT" --quiet \
-            --image "$IMAGE" --no-traffic --tag cd \
+            --image "$IMAGE" --no-traffic --tag livraison \
             --revision-suffix "cd-${GITHUB_SHA::7}"
           INFO=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" \
             --flatten='status.traffic[]' \
             --format='value(status.traffic.tag,status.traffic.revisionName,status.traffic.url)' |
-            awk -F'\t' '$1=="cd"{print $2 "\t" $3; exit}')
+            awk -F'\t' '$1=="livraison"{print $2 "\t" $3; exit}')
           REVISION=${INFO%%$'\t'*}
           echo "Révision : $REVISION"
           echo "Adresse du tag : ${INFO#*$'\t'}"
