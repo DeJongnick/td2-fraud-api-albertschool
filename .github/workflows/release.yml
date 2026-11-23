@@ -1,0 +1,179 @@
+# Déploie une révision de team3-scorer sans trafic, avec un tag : mêmes commandes que release.sh.
+# Extension « Livraison » de la séance 6 : le test de fumée est bloquant. Il vérifie /health, puis
+# score une transaction par /predict sur l'adresse du tag. Une révision qui démarre mais ne sait
+# pas scorer (la « version suivante » de la séance 6) fait échouer le workflow avant toute mise en
+# trafic.
+#
+# Lancement : workflow_dispatch (une fois le fichier sur la branche par défaut), ou push sur la
+# branche ci-livraison, qui lit alors ses paramètres dans .github/release.conf.
+name: release
+
+on:
+  push:
+    branches: [ci-livraison]
+    paths:
+      - .github/release.conf
+      - .github/workflows/release.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag de la révision (candidate, par exemple)
+        required: true
+        default: candidate
+      model:
+        description: Alias ou version du registre, ou - pour garder le modèle de la révision en service
+        required: true
+        default: "-"
+      env:
+        description: Variables à fixer, séparées par des espaces (CLÉ=VALEUR CLÉ=VALEUR)
+        required: false
+        default: ""
+
+env:
+  TEAM: team3
+  REGION: europe-west1
+  PROJECT: advanced-cloud-ai
+  BUCKET: advanced-cloud-ai-models
+  WIF_PROVIDER: projects/191726065850/locations/global/workloadIdentityPools/github/providers/github-actions
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parameters
+        id: params
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          IN_MODEL: ${{ inputs.model }}
+          IN_ENV: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            # Trois lignes CLÉ=VALEUR : TAG, MODEL et ENV.
+            IN_TAG=$(sed -n 's/^TAG=//p' .github/release.conf)
+            IN_MODEL=$(sed -n 's/^MODEL=//p' .github/release.conf)
+            IN_ENV=$(sed -n 's/^ENV=//p' .github/release.conf)
+          fi
+          [ -n "$IN_TAG" ] && [ -n "$IN_MODEL" ] || { echo "TAG et MODEL sont obligatoires"; exit 1; }
+          { echo "tag=$IN_TAG"; echo "model=$IN_MODEL"; echo "env=$IN_ENV"; } >> "$GITHUB_OUTPUT"
+          echo "tag=$IN_TAG model=$IN_MODEL env=$IN_ENV"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.TEAM }}-cd@${{ env.PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy a tagged revision without traffic
+        id: deploy
+        env:
+          TAG: ${{ steps.params.outputs.tag }}
+          MODEL: ${{ steps.params.outputs.model }}
+          OVERRIDES: ${{ steps.params.outputs.env }}
+        run: |
+          set -euo pipefail
+          SERVICE="$TEAM-scorer"
+          [ "$TAG" != champion ] || { echo "le tag champion est réservé"; exit 1; }
+          for pair in $OVERRIDES; do
+            case "$pair" in
+              [A-Z_]*=*) ;;
+              *) echo "variable attendue sous la forme CLÉ=VALEUR en majuscules, reçu : '$pair'"; exit 1 ;;
+            esac
+            case "$pair" in
+              *\;*) echo "le caractère ; est interdit dans '$pair'"; exit 1 ;;
+            esac
+          done
+
+          BASE=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" \
+            --flatten='status.traffic[]' --format='value(status.traffic.percent,status.traffic.revisionName)' |
+            sort -rn | sed -n '1s/^[^[:space:]]*[[:space:]]*//p')
+          [ -n "$BASE" ] || BASE=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" \
+            --format='value(status.latestReadyRevisionName)')
+          IMAGE=$(gcloud run revisions describe "$BASE" --region "$REGION" --project "$PROJECT" \
+            --format='value(spec.containers[0].image)')
+          ENV_LIST=$(gcloud run revisions describe "$BASE" --region "$REGION" --project "$PROJECT" \
+            --flatten='spec.containers[].env[]' --format='value(spec.containers.env.name,spec.containers.env.value)' |
+            while IFS=$'\t' read -r name value; do
+              if [ -n "$name" ]; then printf '%s=%s\n' "$name" "$value"; fi
+            done)
+
+          set_var() {
+            ENV_LIST=$(printf '%s\n' "$ENV_LIST" | grep -v "^$1=" || true)
+            ENV_LIST=$(printf '%s\n%s=%s\n' "$ENV_LIST" "$1" "$2" | grep -v '^$')
+          }
+
+          if [ "$MODEL" != "-" ]; then
+            MODEL_ID=$(gcloud ai models list --region "$REGION" --project "$PROJECT" \
+              --filter="displayName=fraud-scorer-$TEAM" --format='value(name)')
+            INFO=$(gcloud ai models describe "${MODEL_ID##*/}@$MODEL" --region "$REGION" --project "$PROJECT" \
+              --format='value(versionId,artifactUri)')
+            URI=${INFO#*$'\t'}
+            URI=${URI%/}
+            case "$URI" in
+              "gs://$BUCKET/"*) ;;
+              *) echo "artefact hors du bucket gs://$BUCKET : $URI"; exit 1 ;;
+            esac
+            set_var MODELS_DIR "/mnt/models/${URI#gs://$BUCKET/}"
+            set_var MODEL_VERSION "${INFO%%$'\t'*}"
+          fi
+          for pair in $OVERRIDES; do
+            set_var "${pair%%=*}" "${pair#*=}"
+          done
+
+          gcloud run deploy "$SERVICE" --region "$REGION" --project "$PROJECT" --quiet \
+            --image "$IMAGE" --no-traffic --tag "$TAG" \
+            --revision-suffix "$TAG-$(date +%m%d%H%M%S)" \
+            --set-env-vars "^;^$(printf '%s' "$ENV_LIST" | tr '\n' ';')"
+
+          INFO=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" \
+            --flatten='status.traffic[]' \
+            --format='value(status.traffic.tag,status.traffic.revisionName,status.traffic.url)' |
+            awk -F'\t' -v t="$TAG" '$1==t{print $2 "\t" $3; exit}')
+          echo "Révision : ${INFO%%$'\t'*}"
+          echo "Adresse du tag : ${INFO#*$'\t'}"
+          echo "revision=${INFO%%$'\t'*}" >> "$GITHUB_OUTPUT"
+          echo "tag_url=${INFO#*$'\t'}" >> "$GITHUB_OUTPUT"
+          echo "service_url=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
+
+      - name: Identity token for the smoke test
+        id: idtoken
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.TEAM }}-cd@${{ env.PROJECT }}.iam.gserviceaccount.com
+          token_format: id_token
+          id_token_audience: ${{ steps.deploy.outputs.service_url }}
+          id_token_include_email: true
+
+      # Bloquant : pas de continue-on-error. /health seul ne suffit pas (la version suivante de la
+      # séance 6 répondait 200 avec status=ok) : on score donc aussi une transaction. /predict ne
+      # journalise pas de ligne « scored » : le test ne fausse pas les mesures de measure.py.
+      - name: Smoke test /health and /predict
+        env:
+          TAG_URL: ${{ steps.deploy.outputs.tag_url }}
+          ID_TOKEN: ${{ steps.idtoken.outputs.id_token }}
+          REVISION: ${{ steps.deploy.outputs.revision }}
+        run: |
+          set -euo pipefail
+          AUTH="Authorization: Bearer $ID_TOKEN"
+
+          code=$(curl -sS --max-time 30 -o health.json -w '%{http_code}' -H "$AUTH" "$TAG_URL/health")
+          echo "/health : HTTP $code"; cat health.json; echo
+          [ "$code" = 200 ] || { echo "::error::/health renvoie $code sur $REVISION"; exit 1; }
+          jq -e '.status == "ok"' health.json > /dev/null \
+            || { echo "::error::/health ne renvoie pas status=ok sur $REVISION"; exit 1; }
+
+          body='{"transactions":[{"tx_id":"smoke-test","tx_ts":"2026-10-02T10:00:00Z","customer_id":"7989449428740969","terminal_id":"12345","tx_amount":42.0}]}'
+          code=$(curl -sS --max-time 30 -o predict.json -w '%{http_code}' -H "$AUTH" \
+            -H 'Content-Type: application/json' -d "$body" "$TAG_URL/predict")
+          echo "/predict : HTTP $code"; cat predict.json; echo
+          [ "$code" = 200 ] || { echo "::error::/predict renvoie $code sur $REVISION : la révision ne sait pas scorer"; exit 1; }
+          jq -e '.scores[0].score | type == "number" and . >= 0 and . <= 1' predict.json > /dev/null \
+            || { echo "::error::/predict ne renvoie pas de score entre 0 et 1 sur $REVISION"; exit 1; }
+          echo "Test de fumée réussi sur $REVISION"
